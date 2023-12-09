@@ -13,6 +13,12 @@ from pathlib import Path
 from scipy.fft import fft, ifft
 import matplotlib.pyplot as plt
 
+''' NotImplementedError: The operator 'aten::sinc.out' is not currently implemented for the MPS device.
+If you want this op to be added in priority during the prototype phase of this feature,
+please comment on https://github.com/pytorch/pytorch/issues/77764. As a temporary fix, you can set
+the environment variable `PYTORCH_ENABLE_MPS_FALLBACK=1` to use the CPU as a fallback for this op.
+WARNING: this will be slower than running natively on MPS. '''
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 def load_hrtf_signals(hrtf_path: str, hp: dict) -> tuple[ndarray, ndarray]:
     """Loads the HRTF signals for a given head position.
@@ -393,8 +399,8 @@ def featureanalysis(signal):
     dcentroid, bec = histproportion(centroid, N_BINS)
     dbandwidth, beb = histproportion(bandwidth, N_BINS)
     dcontrast, beco = histproportion(contrast, N_BINS)
-    # featvec = np.torch([avgslpcnt, avgiacnt.unsqueeze(dim=0), avgslpiacnt.unsqueeze(dim=0)])
-    monfeats = np.concatenate([dcentroid, bec, dbandwidth, beb, dcontrast, beco])
+    #divide by 1000 in order to report audio frequency in units of kHz
+    monfeats = np.concatenate([dcentroid, bec/1000, dbandwidth, beb/1000, dcontrast, beco/1000])
 
     # binaural features
     fcoefs = pat.MakeErbFilters(SAMPLE_RATE, NUM_CHAN, LOW_FREQ)
@@ -445,29 +451,47 @@ def invPCAproject(gproj: torch.tensor, basisfilename="svd_demixirs_len1999", bas
     recon = torch.matmul(eigspace[:,:neigs],gproj)
     return recon
 
+def mysinc(x):
+    # Handle the case where x is 0
+    x = torch.where(x == 0, torch.tensor([1.], device=x.device), x)
+    return torch.sin(x) / x
+
 class AllPassDelayFilter(torch.nn.Module):
     def __init__(self,
                  LENFILTER=64,
                  Fs = 44100,
+                 device = 'cpu',
                  ):
         super().__init__()
         self.LENFILTER = LENFILTER
         self.Fs = Fs
+        self.device = device
+
 
     def forward(self, delay: torch.Tensor) -> torch.Tensor:
         '''
-        input argument delay is in ms
+        input argument delay is in ms, with batches in axis=0
         
-        return taps of all-pass FIR delay filter as a torch tensor
+        return taps of all-pass FIR delay filter as a torch tensor B x NTAPS
         '''
+        
+        if delay.dim() == 0:
+            batches = 1
+            delay = torch.unsqueeze(delay,dim=0)
+        else:
+            batches = len(delay)
 
-        tau = delay*1e-3*self.Fs # Delay [in samples].
-        n = torch.arange(self.LENFILTER)
-        # Compute sinc filter.
-        h = torch.sinc(n - (self.LENFILTER - 1) / 2 - tau)
-        # Multiply sinc filter by window
-        h *= torch.signal.windows.kaiser(self.LENFILTER)
-        # Normalize to get unity gain.
-        h /= torch.sum(h)
+        n = torch.arange(self.LENFILTER).to(torch.float32).to(self.device)
+        htaps = torch.zeros(batches,self.LENFILTER).to(torch.float32).to(self.device)
+        wind = torch.signal.windows.kaiser(self.LENFILTER).to(torch.float32).to(self.device)
+        for batch in torch.arange(batches):
+            tau = delay[batch]*1e-3*self.Fs # Delay [in samples].
+            # Compute sinc filter.
+            h = mysinc(n - (self.LENFILTER - 1) / 2 - tau)
+            # Multiply sinc filter by window
+            h *= wind
+            # Normalize to get unity gain.
+            h /= torch.sum(h)
+            htaps[batch,:] = h
 
-        return h
+        return htaps
