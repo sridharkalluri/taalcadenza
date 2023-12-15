@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch import nn
 from pathlib import Path
+import matplotlib.pyplot as plt
 
 ''' NotImplementedError: The operator 'aten::sinc.out' is not currently implemented for the MPS device.
 If you want this op to be added in priority during the prototype phase of this feature,
@@ -18,10 +19,18 @@ WARNING: this will be slower than running natively on MPS. '''
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 
+
+from torch.utils.tensorboard import SummaryWriter
+# default `log_dir` is "runs" - we'll be more specific here
+writer = SummaryWriter('runs/xtalkdemix_6')
+
+
+
+
 CHUNK = 4 #duration of chunks of audio, in seconds, from the dataset that will be used in model training
 FEATUREVECSIZE = 547
 LENDEMIXMODEL = 48 #number of parameters in model of DEMIX transfer function
-TARGETDELAY = 4. #millisecond delay of training input in order to promote causal filter result of neural network training
+TARGETDELAY = 1. #millisecond delay of training input in order to promote causal filter result of neural network training
 
 device = (
     "cuda"
@@ -171,9 +180,9 @@ class NeuralNetwork(nn.Module):
         self.linear_relu_stack = nn.Sequential(
             nn.Linear(FEATUREVECSIZE, FEATUREVECSIZE),
             nn.ReLU(),
-            nn.Linear(FEATUREVECSIZE, FEATUREVECSIZE),
+            nn.Linear(FEATUREVECSIZE, 380),
             nn.ReLU(),
-            nn.Linear(FEATUREVECSIZE, LENDEMIXMODEL*4),
+            nn.Linear(380, LENDEMIXMODEL*4),
         )
     def forward(self, x):
         x = self.flatten(x)
@@ -186,7 +195,7 @@ class DemixLoss(nn.Module):
         self.delay = wavindel
         self.samplerate = samplerate
 
-    def forward(self, netpred, xin, target):
+    def forward(self, netpred, xin, target, globind):
 
         # netpred (i.e., the output of the neural network) is a flattened torch tensor 48*4 points long, where each 48 points represents a demix filter
         # the first 47 points are PCA coefficients of the linear-phase component of the demix transfer function
@@ -218,40 +227,58 @@ class DemixLoss(nn.Module):
         # filter xin by cascaded linear phase and all-pass models to predict loudspeaker signals
         fftconvolver = torchaudio.transforms.FFTConvolve(mode='same')
         fftconvolver.to(device)
-        if 0:
-            predLl = torchaudio.functional.fftconvolve(torchaudio.functional.fftconvolve(xin[:,0,:],glhat[:,0,:],mode='same'),gldel[:,0,:],mode='same')
-            predLr = torchaudio.functional.fftconvolve(torchaudio.functional.fftconvolve(xin[:,1,:],grhat[:,0,:],mode='same'),grdel[:,0,:],mode='same')
-            predRl = torchaudio.functional.fftconvolve(torchaudio.functional.fftconvolve(xin[:,0,:],glhat[:,1,:],mode='same'),gldel[:,1,:],mode='same')
-            predRr = torchaudio.functional.fftconvolve(torchaudio.functional.fftconvolve(xin[:,1,:],grhat[:,1,:],mode='same'),grdel[:,1,:],mode='same')
-        elif 1:
-            fftconvolver.to('cpu')
-            predLl = fftconvolver(fftconvolver(xin[:,0,:].cpu(),glhat[:,0,:].cpu()),gldel[:,0,:].cpu())
-            predLr = fftconvolver(fftconvolver(xin[:,1,:].cpu(),grhat[:,0,:].cpu()),grdel[:,0,:].cpu())
-            predRl = fftconvolver(fftconvolver(xin[:,0,:].cpu(),glhat[:,1,:].cpu()),gldel[:,1,:].cpu())
-            predRr = fftconvolver(fftconvolver(xin[:,1,:].cpu(),grhat[:,1,:].cpu()),grdel[:,1,:].cpu())
+        fftconvolver.to('cpu')
+        predLl = fftconvolver(fftconvolver(xin[:,0,:].cpu(),glhat[:,0,:].cpu()),gldel[:,0,:].cpu())
+        predLr = fftconvolver(fftconvolver(xin[:,1,:].cpu(),grhat[:,0,:].cpu()),grdel[:,0,:].cpu())
+        predRl = fftconvolver(fftconvolver(xin[:,0,:].cpu(),glhat[:,1,:].cpu()),gldel[:,1,:].cpu())
+        predRr = fftconvolver(fftconvolver(xin[:,1,:].cpu(),grhat[:,1,:].cpu()),grdel[:,1,:].cpu())
         xLhat = predLl + predLr
         xRhat = predRl + predRr
 
         # compare loudspeaker reconstructions with delayed input. Delaying the input allows the demix filters to be sufficiently delayed to be possible to apply causally
         # Delaying by ~10 milliseconds accounts for sound propagation between loudspeaker and micrphone of approximately 10 feet.
-        delaysamples = torch.tensor(self.delay/1000*self.samplerate)
-        lenfilter = 2**(np.ceil(np.log2(delaysamples.numpy()))+1) #pick a long enough filter so that the delay filter can have better all-pass characteristics
-        wavdelayer = xdmx.AllPassDelayFilter(LENFILTER=lenfilter.astype(int),device=device)
-        wavdelayer.to(device)
-        delayfilter = wavdelayer(self.delay)
-        if 0:
-            targetdel = torchaudio.functional.fftconvolve(target,torch.unsqueeze(delayfilter,dim=1),mode='same')
+        #delaysamples = torch.tensor(self.delay/1000*self.samplerate).to(torch.float32)
+        lenfilter = 2**(2+torch.ceil(torch.log2(self.delay/1000*self.samplerate)).int().item()) #pick a long enough filter so that the delay filter can have better all-pass characteristics
+        if lenfilter == 0:
+            targetdel = target.clone().cpu()
         else:
+            wavdelayer = xdmx.AllPassDelayFilter(LENFILTER=lenfilter,device=device)
+            wavdelayer.to(device)
+            delayfilter = wavdelayer(self.delay)
             targetdel = fftconvolver(target.cpu(),torch.unsqueeze(delayfilter,dim=1).cpu())
 
-        # mean squared error
+        # %% visualize predictions
+        samps = torch.arange(3000)+1000
+        tm = samps/44100
+        fig = plt.figure()
+        #plt.plot(tm,xLhat[2,10000:13000].detach().numpy(),'k')
+        #plt.plot(target[2,1,10000:13000].detach().cpu().numpy(),'b-')
+        #plt.plot(targetdel[2,1,10000:13000].detach().cpu().numpy(),'r--')
+        plt.subplot(2,1,1)
+        plt.plot(tm,xLhat[2,samps].detach().numpy(),'r',
+                tm,target[2,1,samps].detach().cpu().numpy(),'b',
+                tm,targetdel[2,1,samps].detach().cpu().numpy(),'k--')
+        plt.subplot(2,1,2)
+        ftxL = torch.fft.fft(xLhat,n=1024).detach().cpu()
+        fttarget = torch.fft.fft(target[2,1,samps].detach().cpu(),n=1024)
+        fttargetdel = torch.fft.fft(target[2,1,samps].detach().cpu(),n=1024)
+        fx = torch.fft.fftfreq(n=1024)
+        plt.plot(fx[:512],torch.squeeze(20*torch.log10(torch.abs(ftxL[2,:512]))),'r',
+                 fx[:512],20*torch.log10(torch.abs(fttarget[:512])),'b',
+                 fx[:512],20*torch.log10(torch.abs(fttargetdel[:512])),'k--')
+        plt.show
+
         mseloss = 1/2*(torch.mean((xLhat - targetdel[:,0])**2) + torch.mean((xRhat - targetdel[:,1])**2))
+        mseref = 1/2*(torch.mean((xin[:,0,:].cpu() - targetdel[:,0])**2) + torch.mean((xin[:,1,:].cpu() - targetdel[:,1])**2))
+        writer.add_figure(f"Prediction quality {mseloss}, {mseref}, {mseloss/mseref}",fig,global_step=globind)
 
-        return mseloss
 
-def train(dataloader, model, loss_fn, optimizer):
+        # %% return from calculation
+        return mseloss, mseref
+
+def train(dataloader, model, loss_fn, optimizer, epoch):
     size = len(dataloader.dataset)
-    print(f"Size data set = {size}, batches = {len(dataloader)}")
+    print(f"Size data set = {size}, epoch = {epoch}, batches = {len(dataloader)}")
     model.train()
     for batch, (X, xin, y) in enumerate(dataloader):
         print(f"Batch # {batch}")
@@ -262,7 +289,7 @@ def train(dataloader, model, loss_fn, optimizer):
 
         # Compute prediction error
         pred = model(X)
-        loss = loss_fn(pred, xin, y)
+        loss, ref = loss_fn(pred, xin, y, (epoch-1)*size+batch)
 
         # Backpropagation
         loss.backward()
@@ -270,22 +297,34 @@ def train(dataloader, model, loss_fn, optimizer):
         optimizer.zero_grad()
 
         if batch % 1 == 0:
-            loss, current = loss.item(), (batch + 1) * len(X)
-            print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+            loss, refloss, current = loss.item(), ref.item(), (batch + 1) * len(X)
+            print(f"loss: {loss:>7f}, ref: {ref:>7f} [{current:>5d}/{size:>5d}]")
+            writer.add_scalar(f"training loss / epoch {epoch}",loss,batch)
+            writer.add_scalar(f"ref loss / epoch {epoch}",refloss,batch)
+            writer.add_scalar(f"fracloss/ epoch {epoch}",loss/refloss,batch)
 
-def test(dataloader, model, loss_fn):
+
+def test(dataloader, model, loss_fn, epoch):
     size = len(dataloader.dataset)
     num_batches = len(dataloader)
     print(f"Size data set = {size} and num batches = {num_batches}")
     model.eval()
-    test_loss, correct = 0, 0
+    test_loss = 0
     with torch.no_grad():
-        for X, y in dataloader:
-            if device == 'mps':
-                X, y = X.to(torch.float32), y.to(torch.float32)
-            X, y = X.to(device), y.to(device)
+        for batch, (X, xin, y) in enumerate(dataloader):
+            X, xin, y = X.to(torch.float32), xin.to(torch.float32), y.to(torch.float32)
+            X, xin, y = X.to(device), xin.to(device), y.to(device)
             pred = model(X)
-            test_loss += loss_fn(pred, y).item()
+            if 0:
+                test_loss += loss_fn(pred, xin, y, (epoch-1)*size+batch).item()
+            else:
+                loss, ref = loss_fn(pred, xin, y, (epoch-1)*size+batch)
+                test_loss += loss.item()
+            print(f"loss: {loss.item()}, ref: {ref.item()} [{batch:>5d}/{size:>5d}]") 
+            writer.add_scalar(f"Test loss / epoch {epoch}", test_loss, batch)
+            writer.add_scalar(f"Avg test loss / epoch {epoch}",test_loss / (batch+1),batch)
+
+
     test_loss /= num_batches
     print(f"Test Error: \n Avg loss: {test_loss:>8f} \n")
 
@@ -296,7 +335,7 @@ if 1:
     metadatadir = "/Users/sridhar/Documents/Projects/clarity/clarity/cad_icassp_2024/metadata"
     atmic_dir = "/Users/sridhar/Documents/Projects/clarity/clarity/cad_icassp_2024/audio/at_mic_music"
     audio_dir = "/Users/sridhar/Documents/Projects/clarity/clarity/cad_icassp_2024/audio/music"
-BATCH = 50
+BATCH = 200
 EPOCHS = 1
 PROPORTIONTEST = 0.2
 
@@ -307,36 +346,37 @@ dataset = AtMicCadenzaICASSP2024_2(
 )
 
 dataset_size = len(dataset)
-train_size = int(PROPORTIONTEST * dataset_size)  # 80% for training
-test_size = dataset_size - train_size  # 20% for testing
+test_size = int(PROPORTIONTEST * dataset_size)  # 20% for testing
+train_size = dataset_size - test_size  # 80% for training
 
 train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
 train_dataloader = DataLoader(train_dataset, batch_size=BATCH,shuffle=True)
 test_dataloader = DataLoader(test_dataset, batch_size=BATCH,shuffle=True)
 
 
-# Move model to computational engine
+# Move neural network model and loss computing object to computational engine
 model = NeuralNetwork().to(device)
+if 1: #warm start model
+    model.load_state_dict(torch.load("xtalkdemix_model_weights_epoch2.pth"), strict=False)
 print(model)
-loss_fn = DemixLoss(torch.tensor(TARGETDELAY)).to(device)
-optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+loss_fn = DemixLoss(torch.tensor(TARGETDELAY).to(device)).to(device)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
 if 0:
-    # Review features and target
-    train_features, train_target = next(iter(train_dataloader))
-    print(f"Features batch shape: {train_features.size()}")
-    print(f"Targets batch shape: {train_target.size()}")
-    test_features, test_target = next(iter(test_dataloader))
+    # Visualize features, input, neural network, and target
+    train_features, train_input, train_target = next(iter(train_dataloader))
+    writer.add_graph(model, train_features.to(torch.float32).to(device))
+
+    test_features, test_input, test_target = next(iter(test_dataloader))
     print(f"Features batch shape: {test_features.size()}")
     print(f"Targets batch shape: {test_target.size()}")
 
-    # Compute model predictions in the computational engine
-    # "MPS" device does not accept float64, hence use float32
-    #pred = model(train_features.to(torch.float32).to(device))
-elif 1:
-    for t in range(EPOCHS):
-        print(f"Epoch {t+1}\n-------------------------------")
-        train(train_dataloader, model, loss_fn, optimizer)
-        #test(test_dataloader, model, loss_fn)
+# Perform training and testing run
+for t in range(EPOCHS):
+    print(f"Epoch {t+1}\n-------------------------------")
+    train(train_dataloader, model, loss_fn, optimizer, t+1)
+    test(test_dataloader, model, loss_fn, t+1)
+    torch.save(model.state_dict(),f"xtalkdemix_model_weights_epoch{t+1}.pth")
 
+writer.close()
 print("Done!")
